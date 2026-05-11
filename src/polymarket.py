@@ -9,6 +9,7 @@ Příklad: btc-updown-5m-1778255700  = trh od 15:55 do 16:00 UTC
 """
 
 import asyncio
+import json
 import logging
 import time
 
@@ -42,6 +43,8 @@ async def _fetch_market(slug: str) -> dict | None:
                 return None
             market = markets[0]
             prices = market.get("outcomePrices", [])
+            if isinstance(prices, str):
+                prices = json.loads(prices)
             try:
                 yes = round(float(prices[0]), 3)
                 no  = round(float(prices[1]), 3)
@@ -64,8 +67,8 @@ async def fetch_updown_markets() -> list[dict]:
     Načte aktuální 5min a 15min BTC Up/Down trhy.
     Pokud aktuální neexistuje, zkusí předchozí periodu.
     """
-    slugs_5m  = [_market_slug(300), _market_slug(300, -300)]    # aktuální nebo předchozí
-    slugs_15m = [_market_slug(900), _market_slug(900, -900)]
+    slugs_5m  = [_market_slug(300), _market_slug(300, -300), _market_slug(300, -600)]
+    slugs_15m = [_market_slug(900), _market_slug(900, -900), _market_slug(900, -1800)]
 
     results_5m, results_15m = await asyncio.gather(
         _try_slugs(slugs_5m),
@@ -77,9 +80,9 @@ async def fetch_updown_markets() -> list[dict]:
 
 
 async def _try_slugs(slugs: list[str]) -> dict | None:
-    """Zkusí slugy jeden po druhém, vrátí první úspěšný."""
+    """Zkusí slugy jeden po druhém, vrátí první s platnými cenami."""
     for slug in slugs:
         m = await _fetch_market(slug)
-        if m:
+        if m and m["yes"] is not None:
             return m
     return None

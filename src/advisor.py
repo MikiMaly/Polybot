@@ -12,7 +12,7 @@ import json
 import logging
 from datetime import datetime
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 
 from config import Config
 from models import Candle, Indicators, Signal
@@ -103,8 +103,8 @@ class OpenRouterAdvisor:
                     ],
                 )
                 break
-            except Exception as e:
-                if attempt < 2 and ("429" in str(e) or "rate" in str(e).lower()):
+            except RateLimitError:
+                if attempt < 2:
                     wait = 15 * (attempt + 1)
                     log.warning(f"Rate limit, čekám {wait}s...")
                     await asyncio.sleep(wait)

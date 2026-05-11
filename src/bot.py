@@ -44,6 +44,8 @@ class SignalBot:
         self.advisor = OpenRouterAdvisor(config)
         self.buffer: deque = deque(maxlen=100)
         self._last_signal_time: float = 0
+        self._http: httpx.AsyncClient = httpx.AsyncClient(timeout=10)
+        self._analysis_task: asyncio.Task | None = None
 
     async def run(self):
         """Hlavní smyčka bota — stream svíček + periodický analyzér."""
@@ -57,11 +59,13 @@ class SignalBot:
         historical = await fetch_historical(self.config)
         self.buffer.extend(historical)
 
-        # Spustí periodický analyzér souběžně se streamem svíček
-        asyncio.create_task(self._periodic_loop())
+        self._analysis_task = asyncio.create_task(self._periodic_loop())
 
-        async for _ in stream_candles(self.config, self.buffer):
-            pass  # buffer aktualizuje stream_candles sám
+        try:
+            async for _ in stream_candles(self.config, self.buffer):
+                pass  # buffer aktualizuje stream_candles sám
+        finally:
+            await self._http.aclose()
 
     async def _periodic_loop(self):
         """Spouští analýzu každých analysis_interval sekund."""
@@ -94,14 +98,13 @@ class SignalBot:
             f"Cross: {ind.ema_cross} | Vol: {ind.volume_ratio}x"
         )
 
-        self._last_signal_time = now
-
         poly_markets = await fetch_updown_markets()
         if poly_markets:
             log.info(f"📈 Polymarket: {len(poly_markets)} BTC trhů načteno")
 
         try:
             signal = await self.advisor.get_signal(candles, ind, poly_markets)
+            self._last_signal_time = now
             self._log_signal(signal)
             self._save_signal(signal)
             await self._push_signal(signal)
@@ -136,13 +139,12 @@ class SignalBot:
         if not self.config.hub_api_url or not self.config.hub_bot_secret:
             return
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
-                    self.config.hub_api_url,
-                    json=signal.to_dict(),
-                    headers={"Authorization": f"Bearer {self.config.hub_bot_secret}"},
-                )
-                r.raise_for_status()
-                log.debug("Signál odeslán na hub.")
+            r = await self._http.post(
+                self.config.hub_api_url,
+                json=signal.to_dict(),
+                headers={"Authorization": f"Bearer {self.config.hub_bot_secret}"},
+            )
+            r.raise_for_status()
+            log.debug("Signál odeslán na hub.")
         except Exception as e:
             log.warning(f"Nepodařilo se odeslat signál na hub: {e}")

@@ -47,6 +47,23 @@ class Config:
             raise EnvironmentError(
                 "Chybí OPENROUTER_API_KEY. Nastav ho v .env nebo jako env proměnnou."
             )
+        cfg.openrouter_model = os.environ.get("OPENROUTER_MODEL", cfg.openrouter_model)
+        cfg.openrouter_max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", cfg.openrouter_max_tokens))
+
+        cfg.symbol = os.environ.get("SYMBOL", cfg.symbol)
+        cfg.interval = os.environ.get("INTERVAL", cfg.interval)
+        cfg.initial_candles = int(os.environ.get("INITIAL_CANDLES", cfg.initial_candles))
+
+        cfg.rsi_period = int(os.environ.get("RSI_PERIOD", cfg.rsi_period))
+        cfg.ema_fast = int(os.environ.get("EMA_FAST", cfg.ema_fast))
+        cfg.ema_slow = int(os.environ.get("EMA_SLOW", cfg.ema_slow))
+        cfg.candle_history = int(os.environ.get("CANDLE_HISTORY", cfg.candle_history))
+
+        cfg.min_confidence = float(os.environ.get("MIN_CONFIDENCE", cfg.min_confidence))
+        cfg.signal_cooldown = int(os.environ.get("SIGNAL_COOLDOWN", cfg.signal_cooldown))
+        cfg.analysis_interval = int(os.environ.get("ANALYSIS_INTERVAL", cfg.analysis_interval))
+
+        cfg.signals_log = os.environ.get("SIGNALS_LOG", cfg.signals_log)
         cfg.hub_api_url = os.environ.get("HUB_API_URL", "")
         cfg.hub_bot_secret = os.environ.get("HUB_BOT_SECRET", "")
         return cfg
