@@ -1,148 +1,128 @@
 """
-bot.py — Hlavní orchestrátor bota.
+bot.py — Orchestrátor lifecycle.
 
-Logika životního cyklu:
-  1. Načte historická data (feed.fetch_historical)
-  2. Inicializuje buffer svíček (deque s maxlen=100)
-  3. Spustí WebSocket stream + periodický analyzér souběžně
-  4. Na každé uzavřené svíčce aktualizuje buffer
-  5. Každých ~2 minuty (analysis_interval):
-     a. Zkontroluje cooldown
-     b. Vypočítá indikátory
-     c. Načte Polymarket YES/NO ceny
-     d. Zavolá OpenRouter (advisor.get_signal)
-     e. Loguje signál + uloží JSONL + odešle na hub
+Zodpovědnosti:
+  - REST backfill historie do bufferu
+  - tři souběžné tasky: feed stream + periodická analýza + (volitelné) settler
+  - graceful shutdown přes asyncio.Event
+  - propagace chyb (pokud jeden task umře, ostatní jsou cancelovány)
+
+Vše ostatní (indikátory, AI volání, persistence, trading) řeší AnalysisPipeline
+a Settler.
 """
 
 import asyncio
-import json
 import logging
-import time
-from collections import deque
+from typing import Optional, Set
 
 import httpx
 
 from config import Config
 from feed import fetch_historical, stream_candles
-from indicators import compute_indicators
-from advisor import OpenRouterAdvisor
-from polymarket import fetch_updown_markets
-from models import Signal
+from models import CandleBuffer
+from pipeline import AnalysisPipeline
+from trading import Settler
 
 log = logging.getLogger(__name__)
 
-ACTION_EMOJI = {
-    "BUY_UP":   "🟢",
-    "BUY_DOWN": "🔴",
-    "SKIP":     "⚪",
-}
-
 
 class SignalBot:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        pipeline: AnalysisPipeline,
+        buffer: CandleBuffer,
+        http: httpx.AsyncClient,
+        settler: Optional[Settler] = None,
+    ):
         self.config = config
-        self.advisor = OpenRouterAdvisor(config)
-        self.buffer: deque = deque(maxlen=100)
-        self._last_signal_time: float = 0
+        self.pipeline = pipeline
+        self.buffer = buffer
+        self.http = http
+        self.settler = settler
+        self._stop = asyncio.Event()
+        self._tasks: Set[asyncio.Task] = set()
 
-    async def run(self):
-        """Hlavní smyčka bota — stream svíček + periodický analyzér."""
+    def request_stop(self) -> None:
+        """Graceful shutdown — feed i analýza dokončí aktuální iteraci."""
+        log.info("Stop požadován, ukončuji...")
+        self._stop.set()
+
+    async def run(self) -> None:
         log.info("=" * 60)
         log.info("BTC Polymarket Signal Bot — START")
-        log.info(f"Model: {self.config.openrouter_model}")
-        log.info(f"Min confidence: {self.config.min_confidence:.0%}")
-        log.info(f"Analýza každých: {self.config.analysis_interval}s")
+        log.info(f"  Strategy:  {self.pipeline.strategy.name}")
+        log.info(f"  Model:     {self.config.openrouter_model}")
+        log.info(f"  Min conf:  {self.config.min_confidence:.0%}")
+        log.info(f"  Interval:  {self.config.analysis_interval_seconds}s")
+        log.info(f"  Symbol:    {self.config.symbol} {self.config.interval}")
         log.info("=" * 60)
 
-        historical = await fetch_historical(self.config)
+        historical = await fetch_historical(self.config, self.http)
         self.buffer.extend(historical)
 
-        # Spustí periodický analyzér souběžně se streamem svíček
-        asyncio.create_task(self._periodic_loop())
+        feed_task = asyncio.create_task(self._feed_loop(), name="feed")
+        analysis_task = asyncio.create_task(self._analysis_loop(), name="analysis")
+        self._tasks = {feed_task, analysis_task}
 
-        async for _ in stream_candles(self.config, self.buffer):
-            pass  # buffer aktualizuje stream_candles sám
-
-    async def _periodic_loop(self):
-        """Spouští analýzu každých analysis_interval sekund."""
-        await asyncio.sleep(self.config.analysis_interval)  # počkej na naplnění bufferu
-        while True:
-            await self._run_analysis()
-            await asyncio.sleep(self.config.analysis_interval)
-
-    async def _run_analysis(self):
-        """Provede jednu analýzu — indikátory + Polymarket + AI signál."""
-        now = time.time()
-        elapsed = now - self._last_signal_time
-        if elapsed < self.config.signal_cooldown:
-            log.debug(f"Cooldown: {self.config.signal_cooldown - elapsed:.0f}s zbývá")
-            return
-
-        candles = list(self.buffer)
-        if not candles:
-            return
-
-        ind = compute_indicators(candles, self.config.ema_fast, self.config.ema_slow)
-        if not ind.ready:
-            log.info(f"⏳ Nedostatek dat pro indikátory ({len(candles)} svíček). Čekám...")
-            return
-
-        latest = candles[-1]
-        log.info(
-            f"📊 {latest.dt} UTC | Close: ${latest.close:,.0f} | "
-            f"RSI: {ind.rsi_14} | EMA9/21: {ind.ema_fast:.0f}/{ind.ema_slow:.0f} | "
-            f"Cross: {ind.ema_cross} | Vol: {ind.volume_ratio}x"
-        )
-
-        self._last_signal_time = now
-
-        poly_markets = await fetch_updown_markets()
-        if poly_markets:
-            log.info(f"📈 Polymarket: {len(poly_markets)} BTC trhů načteno")
-
-        try:
-            signal = await self.advisor.get_signal(candles, ind, poly_markets)
-            self._log_signal(signal)
-            self._save_signal(signal)
-            await self._push_signal(signal)
-
-        except Exception as e:
-            log.error(f"Neočekávaná chyba: {e}", exc_info=True)
-
-    def _log_signal(self, signal: Signal):
-        emoji = ACTION_EMOJI.get(signal.action, "❓")
-        log.info(
-            f"{emoji} SIGNAL: {signal.action} | "
-            f"Confidence: {signal.confidence:.0%} | "
-            f"Price: ${signal.btc_price:,.0f}"
-        )
-        log.info(f"   💬 {signal.reasoning}")
-        log.info(f"   📍 Market: {signal.suggested_market}")
-
-        if signal.is_actionable:
-            log.warning(
-                f"⚡ AKČNÍ SIGNÁL ({signal.confidence:.0%}): "
-                f"{signal.action} → {signal.suggested_market}"
+        if self.settler is not None:
+            settler_task = asyncio.create_task(
+                self.settler.run(self._stop), name="settler"
             )
+            self._tasks.add(settler_task)
 
-    def _save_signal(self, signal: Signal):
         try:
-            with open(self.config.signals_log, "a", encoding="utf-8") as f:
-                f.write(json.dumps(signal.to_dict(), ensure_ascii=False) + "\n")
-        except OSError as e:
-            log.error(f"Nepodařilo se zapsat signál: {e}")
+            done, pending = await asyncio.wait(
+                self._tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
-    async def _push_signal(self, signal: Signal):
-        if not self.config.hub_api_url or not self.config.hub_bot_secret:
-            return
+            for t in done:
+                exc = t.exception()
+                if exc:
+                    log.error(f"Task {t.get_name()} skončil s chybou: {exc}", exc_info=exc)
+                    raise exc
+        finally:
+            self._tasks.clear()
+
+    async def _feed_loop(self) -> None:
+        """Konzumuje WS stream a aktualizuje buffer."""
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
-                    self.config.hub_api_url,
-                    json=signal.to_dict(),
-                    headers={"Authorization": f"Bearer {self.config.hub_bot_secret}"},
+            async for candle in stream_candles(self.config):
+                if self._stop.is_set():
+                    return
+                self.buffer.update(candle)
+                if candle.closed:
+                    log.debug(f"Uzavřená svíčka: {candle.dt} | C:{candle.close:.0f}")
+        except asyncio.CancelledError:
+            log.debug("Feed loop cancelled.")
+            raise
+
+    async def _analysis_loop(self) -> None:
+        """Spouští pipeline.run_once() v intervalu."""
+        # Nech buffer naplnit alespoň jedním cyklem než spustíme první analýzu.
+        try:
+            await asyncio.wait_for(
+                self._stop.wait(),
+                timeout=self.config.analysis_interval_seconds,
+            )
+            return  # stop signal během čekání
+        except asyncio.TimeoutError:
+            pass
+
+        while not self._stop.is_set():
+            try:
+                await self.pipeline.run_once()
+            except Exception as e:
+                log.error(f"Pipeline run_once selhal: {e}", exc_info=True)
+
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=self.config.analysis_interval_seconds,
                 )
-                r.raise_for_status()
-                log.debug("Signál odeslán na hub.")
-        except Exception as e:
-            log.warning(f"Nepodařilo se odeslat signál na hub: {e}")
+                return  # stop signal mezi cykly
+            except asyncio.TimeoutError:
+                continue

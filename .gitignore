@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
-logs/*.log
-logs/*.jsonl
+**/logs/*.log
+**/logs/*.jsonl
+**/logs/*.json
 .vscode/

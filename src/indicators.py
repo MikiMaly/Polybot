@@ -1,112 +1,104 @@
 """
-indicators.py — Výpočet technických indikátorů.
+indicators.py — Technické indikátory (čisté funkce, snadno testovatelné).
 
-Logika:
-  RSI(14)  — Relative Strength Index: měří rychlost a velikost cenových pohybů.
-              > 70 = překoupeno (možný pokles), < 30 = přeprodáno (možný růst).
-  EMA(9)   — Rychlá exponenciální klouzavá průměr: sleduje krátkodobý trend.
-  EMA(21)  — Pomalá EMA: sleduje střednědobý trend.
-  EMA Cross — Překřížení EMA9 a EMA21:
-               bullish = EMA9 překříží EMA21 zdola (signál růstu)
-               bearish = EMA9 překříží EMA21 shora (signál poklesu)
-  Volume Ratio — Aktuální objem / průměrný objem (20 svíček).
-                 > 1.5 = zvýšená aktivita trhu (potvrzuje signál)
+  RSI(14)        — Wilder's smoothing (SMA seed → rolling EMA gains/losses)
+  EMA(9), EMA(21)— SMA seed pro prvních N period, pak standardní EMA
+  EMA Cross      — bullish/bearish/neutral (porovnání posledních dvou bodů)
+  Volume ratio   — current volume / průměr trailing 20 svíček (BEZ aktuální)
 """
 
 from typing import List
+
 from models import Candle, Indicators
 
 
 def compute_ema(values: List[float], period: int) -> List[float]:
     """
-    Exponenciální klouzavý průměr.
+    EMA se SMA seedem. Vrací sérii zarovnanou na konec vstupu.
 
-    Vzorec: EMA_t = price_t * k + EMA_(t-1) * (1 - k)
-    kde k = 2 / (period + 1)
-
-    Inicializace: první hodnota EMA = první cena (SMA by bylo přesnější,
-    ale pro live data s dostatečnou historií je rozdíl zanedbatelný).
+    Pro vstup délky N a period P vrátí seznam délky N - P + 1
+    (první EMA bod = SMA prvních P hodnot, pak postupně dál).
     """
-    if not values:
+    if len(values) < period:
         return []
     k = 2 / (period + 1)
-    result = [values[0]]
-    for v in values[1:]:
+    seed = sum(values[:period]) / period
+    result = [seed]
+    for v in values[period:]:
         result.append(v * k + result[-1] * (1 - k))
     return result
 
 
 def compute_rsi(closes: List[float], period: int = 14) -> float:
     """
-    Relative Strength Index (Wilder's RSI).
+    Wilder's RSI: SMA seed prvních N period, pak rolling EMA-like smoothing.
 
-    1. Spočítá denní změny cen (delta).
-    2. Oddělí zisky (gains) a ztráty (losses).
-    3. Průměrný zisk / průměrná ztráta = RS.
-    4. RSI = 100 - (100 / (1 + RS))
-
-    Vrací 50.0 pokud nemáme dostatek dat.
+    avg_gain_t = (avg_gain_{t-1} * (N-1) + gain_t) / N
+    avg_loss_t = (avg_loss_{t-1} * (N-1) + loss_t) / N
+    RSI = 100 - 100 / (1 + avg_gain / avg_loss)
     """
     if len(closes) < period + 1:
         return 50.0
 
     deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    recent = deltas[-period:]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
 
-    gains = [max(d, 0) for d in recent]
-    losses = [abs(min(d, 0)) for d in recent]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
     if avg_loss == 0:
         return 100.0
-
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
 
 
-def compute_indicators(candles: List[Candle], ema_fast: int = 9, ema_slow: int = 21) -> Indicators:
+def compute_indicators(
+    candles: List[Candle],
+    ema_fast_period: int = 9,
+    ema_slow_period: int = 21,
+) -> Indicators:
     """
-    Vypočte všechny indikátory z listu svíček.
+    Sestaví Indicators z listu svíček.
 
-    Potřebuje alespoň ema_slow + 2 svíček pro detekci crossu
-    (porovnává aktuální a předchozí stav EMA).
+    Potřebuje >= ema_slow_period + 2 svíček pro EMA cross detekci.
     """
-    if len(candles) < ema_slow + 2:
+    if len(candles) < ema_slow_period + 2:
         return Indicators()
 
     closes = [c.close for c in candles]
     volumes = [c.volume for c in candles]
 
-    # RSI
     rsi_val = compute_rsi(closes)
 
-    # EMA — počítáme z celé historie pro přesnost
-    ema_fast_series = compute_ema(closes, ema_fast)
-    ema_slow_series = compute_ema(closes, ema_slow)
+    fast_series = compute_ema(closes, ema_fast_period)
+    slow_series = compute_ema(closes, ema_slow_period)
+    if len(fast_series) < 2 or len(slow_series) < 2:
+        return Indicators()
 
-    ema_fast_now = ema_fast_series[-1]
-    ema_slow_now = ema_slow_series[-1]
-    ema_fast_prev = ema_fast_series[-2]
-    ema_slow_prev = ema_slow_series[-2]
+    fast_now, fast_prev = fast_series[-1], fast_series[-2]
+    slow_now, slow_prev = slow_series[-1], slow_series[-2]
 
-    # EMA cross detekce
-    if ema_fast_prev < ema_slow_prev and ema_fast_now > ema_slow_now:
-        cross = "bullish"   # EMA9 překřížila EMA21 zdola → bull signal
-    elif ema_fast_prev > ema_slow_prev and ema_fast_now < ema_slow_now:
-        cross = "bearish"   # EMA9 překřížila EMA21 shora → bear signal
+    if fast_prev <= slow_prev and fast_now > slow_now:
+        cross = "bullish"
+    elif fast_prev >= slow_prev and fast_now < slow_now:
+        cross = "bearish"
     else:
         cross = "neutral"
 
-    # Volume ratio
-    avg_vol = sum(volumes[-20:]) / min(len(volumes), 20)
+    # Volume ratio: aktuální vs průměr předchozích 20 (BEZ aktuální).
+    window = volumes[-21:-1] if len(volumes) >= 21 else volumes[:-1]
+    avg_vol = sum(window) / len(window) if window else 0.0
     vol_ratio = round(volumes[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
 
     return Indicators(
         rsi_14=rsi_val,
-        ema_fast=round(ema_fast_now, 2),
-        ema_slow=round(ema_slow_now, 2),
+        ema_fast=round(fast_now, 2),
+        ema_slow=round(slow_now, 2),
         ema_cross=cross,
         volume_ratio=vol_ratio,
     )
